@@ -48,7 +48,8 @@ enableIndexedDbPersistence(db).catch((err) => {
 // ══════════════════════════════════════════════
 // إعدادات النظام الافتراضية (قابلة للتعديل من شاشة الإعدادات وتُحفظ في localStorage)
 const DEFAULT_SETTINGS = {
-  meterPrice: 14,
+  meterPrice: 14,            // سعر الدفع للسائق (تكلفة المتر الواحد)
+  clientMeterPrice: 15,      // سعر البيع للشركة الرئيسية (إيراد المتر الواحد)
   companyName: 'شركتي',
   companyBranch: 'الفرع الرئيسي',
   companyAddress: '',
@@ -425,28 +426,132 @@ function updateSum() {
   renderBreakdown(); renderDashRecent(); renderActivityLog(); renderPnL();
 }
 
-// تقرير الربح والخسارة (P&L) — إيرادات الأمتار في مقابل إجمالي المصروفات
+// قائمة الأرباح والخسائر (P&L) — وفق نموذج مقاولات نقل الرمل:
+// نشتري الأمتار من السائقين بسعر التكلفة، ونبيعها للشركة الرئيسية بسعر أعلى.
 function renderPnL() {
   const el = document.getElementById('pnl-card'); if (!el) return;
-  let revenue = 0, expenses = 0, meters = 0;
-  DB_entries.forEach(e => {
-    if (e.type === 'meter') { revenue += (e.crd || 0); meters += (e.met || 0); }
-    if (e.type === 'expense') expenses += (e.crd || 0);
-  });
-  const net = revenue - expenses;
-  const margin = revenue > 0 ? Math.round((net / revenue) * 100) : 0;
+  const costPerMeter = getSetting('meterPrice');         // 14 ر.س (للسائق)
+  const salePerMeter = getSetting('clientMeterPrice');   // 15 ر.س (من الشركة)
   const cur = CUR();
-  const marginColor = net >= 0 ? 'var(--green)' : 'var(--red)';
+
+  // تجميع الأمتار وتكاليفها الفعلية + المصروفات التشغيلية
+  let meters = 0, actualDriverCost = 0, opExpenses = 0;
+  const opBreakdown = {}; // تجميع المصروفات حسب التصنيف
+  DB_entries.forEach(e => {
+    if (e.type === 'meter') {
+      meters += (e.met || 0);
+      actualDriverCost += (e.crd || 0); // ما دُفع فعلياً للسائق
+    }
+    if (e.type === 'expense') {
+      const amt = (e.crd || 0);
+      opExpenses += amt;
+      const k = e.etLabel || EL[e.et] || 'أخرى';
+      opBreakdown[k] = (opBreakdown[k] || 0) + amt;
+    }
+  });
+
+  // الحسابات المحاسبية
+  const revenue       = +(meters * salePerMeter).toFixed(2);  // الإيرادات (سعر البيع × الأمتار)
+  const cogs          = +(meters * costPerMeter).toFixed(2);  // تكلفة المبيعات النظرية
+  const grossProfit   = +(revenue - cogs).toFixed(2);          // مجمل الربح
+  const grossMargin   = revenue > 0 ? +((grossProfit / revenue) * 100).toFixed(1) : 0;
+  const netProfit     = +(grossProfit - opExpenses).toFixed(2);// صافي الربح
+  const netMargin     = revenue > 0 ? +((netProfit / revenue) * 100).toFixed(1) : 0;
+  const profitPerMeter = +(salePerMeter - costPerMeter).toFixed(2);
+  const costVariance  = +(actualDriverCost - cogs).toFixed(2); // فرق بين المدفوع الفعلي والنظري
+
+  // ترتيب المصروفات تنازلياً
+  const breakdownRows = Object.entries(opBreakdown).sort((a,b)=>b[1]-a[1]).map(([k,v]) => {
+    const pct = opExpenses > 0 ? Math.round(v/opExpenses*100) : 0;
+    return `<div class="pnl-bd-row"><span>${k}</span><span><strong>${fEN(v)}</strong> ${cur} <span style="color:var(--text3);font-size:.7rem">(${pct}%)</span></span></div>`;
+  }).join('');
+
+  const netColor = netProfit >= 0 ? 'var(--green)' : 'var(--red)';
+
   el.innerHTML = `
-    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px">
-      <div class="pnl-tile" style="border-top:3px solid var(--green)"><div class="pnl-l">إيرادات الأمتار</div><div class="pnl-v" style="color:var(--green)">${fEN(revenue)}</div><div class="pnl-sub">${fEN(meters)} م × ${getSetting('meterPrice')} ${cur}</div></div>
-      <div class="pnl-tile" style="border-top:3px solid var(--red)"><div class="pnl-l">إجمالي المصروفات</div><div class="pnl-v" style="color:var(--red)">${fEN(expenses)}</div><div class="pnl-sub">${cur}</div></div>
-      <div class="pnl-tile" style="border-top:3px solid ${net>=0?'var(--green)':'var(--red)'}"><div class="pnl-l">صافي الربح/الخسارة</div><div class="pnl-v" style="color:${marginColor}">${fEN(net)}</div><div class="pnl-sub">هامش ${margin}%</div></div>
+    <!-- ملخص علوي بثلاث بطاقات -->
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:14px">
+      <div class="pnl-tile" style="border-top:3px solid var(--b500)">
+        <div class="pnl-l">إجمالي الأمتار</div>
+        <div class="pnl-v" style="color:var(--b600)">${fEN(meters)}</div>
+        <div class="pnl-sub">متر مكعب</div>
+      </div>
+      <div class="pnl-tile" style="border-top:3px solid var(--amber)">
+        <div class="pnl-l">ربح كل متر</div>
+        <div class="pnl-v" style="color:var(--amber)">${fEN(profitPerMeter)}</div>
+        <div class="pnl-sub">${salePerMeter} − ${costPerMeter} ${cur}</div>
+      </div>
+      <div class="pnl-tile" style="border-top:3px solid ${netColor}">
+        <div class="pnl-l">صافي الربح</div>
+        <div class="pnl-v" style="color:${netColor}">${fEN(netProfit)}</div>
+        <div class="pnl-sub">هامش ${netMargin}%</div>
+      </div>
     </div>
-    <div style="background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:10px 14px;font-size:.78rem;color:var(--text2);line-height:1.7">
-      <strong style="color:var(--b600)">📌 الخلاصة المالية:</strong>
-      ${net >= 0 ? `النشاط يحقق <strong style="color:var(--green)">ربحاً صافياً</strong> بقيمة ${fEN(net)} ${cur}` : `النشاط يعاني من <strong style="color:var(--red)">خسارة</strong> بقيمة ${fEN(Math.abs(net))} ${cur} — راجع المصروفات`}
-      ${revenue > 0 ? ` — كل متر مُسجَّل يساوي ${getSetting('meterPrice')} ${cur} من الإيرادات.` : ''}
+
+    <!-- قائمة الأرباح والخسائر التفصيلية (شكل تقرير محاسبي رسمي) -->
+    <div class="pnl-statement">
+      <!-- الإيرادات -->
+      <div class="pnl-section">
+        <div class="pnl-section-h">📈 الإيرادات (Revenue)</div>
+        <div class="pnl-line">
+          <span>إيرادات بيع الأمتار للشركة الرئيسية</span>
+          <span>${fEN(meters)} م × ${salePerMeter} = <strong style="color:var(--green)">${fEN(revenue)}</strong></span>
+        </div>
+        <div class="pnl-line pnl-subtotal">
+          <span>إجمالي الإيرادات</span>
+          <span style="color:var(--green)"><strong>${fEN(revenue)} ${cur}</strong></span>
+        </div>
+      </div>
+
+      <!-- تكلفة المبيعات -->
+      <div class="pnl-section">
+        <div class="pnl-section-h">📉 تكلفة المبيعات (COGS)</div>
+        <div class="pnl-line">
+          <span>المدفوع للسائقين (نظرياً)</span>
+          <span>${fEN(meters)} م × ${costPerMeter} = <strong style="color:var(--red)">${fEN(cogs)}</strong></span>
+        </div>
+        ${Math.abs(costVariance) > 0.5 ? `
+        <div class="pnl-line" style="font-size:.72rem;color:var(--text3);font-style:italic">
+          <span>المدفوع فعلياً: ${fEN(actualDriverCost)} ${cur}</span>
+          <span style="color:${costVariance>0?'var(--red)':'var(--green)'}">${costVariance>0?'+':''}${fEN(costVariance)} انحراف</span>
+        </div>` : ''}
+        <div class="pnl-line pnl-subtotal">
+          <span>إجمالي تكلفة المبيعات</span>
+          <span style="color:var(--red)"><strong>(${fEN(cogs)}) ${cur}</strong></span>
+        </div>
+      </div>
+
+      <!-- مجمل الربح -->
+      <div class="pnl-line pnl-gross">
+        <span>💰 مجمل الربح (Gross Profit)</span>
+        <span>${fEN(grossProfit)} ${cur} <span style="font-size:.7rem;opacity:.7">(هامش ${grossMargin}%)</span></span>
+      </div>
+
+      <!-- المصروفات التشغيلية -->
+      <div class="pnl-section">
+        <div class="pnl-section-h">🏷️ المصروفات التشغيلية (OpEx)</div>
+        ${breakdownRows || '<div class="pnl-line" style="color:var(--text3);font-style:italic"><span>لا توجد مصروفات تشغيلية مسجلة</span><span>0.00</span></div>'}
+        <div class="pnl-line pnl-subtotal">
+          <span>إجمالي المصروفات التشغيلية</span>
+          <span style="color:var(--red)"><strong>(${fEN(opExpenses)}) ${cur}</strong></span>
+        </div>
+      </div>
+
+      <!-- صافي الربح -->
+      <div class="pnl-line pnl-net">
+        <span>📊 صافي الربح/الخسارة (Net Profit)</span>
+        <span style="color:${netColor}">${fEN(netProfit)} ${cur} <span style="font-size:.72rem">(هامش ${netMargin}%)</span></span>
+      </div>
+    </div>
+
+    <!-- خلاصة سريعة -->
+    <div class="pnl-summary">
+      <strong style="color:var(--b600)">📌 الخلاصة:</strong>
+      ${meters === 0
+        ? 'لم تُسجَّل أي أمتار بعد — أضِف سندات الأمتار لرؤية تحليل الربحية.'
+        : netProfit >= 0
+          ? `نقلت <strong>${fEN(meters)} م</strong> من الرمل بربح صافٍ <strong style="color:var(--green)">${fEN(netProfit)} ${cur}</strong>. كل متر يدخل ${profitPerMeter} ${cur} ربح إجمالي، والمصروفات التشغيلية أكلت ${opExpenses>0?fEN(opExpenses)+' '+cur:'لا شيء'}.`
+          : `النشاط يعاني من <strong style="color:var(--red)">خسارة ${fEN(Math.abs(netProfit))} ${cur}</strong>. السبب: المصروفات التشغيلية (${fEN(opExpenses)}) أكبر من مجمل الربح (${fEN(grossProfit)}). راجع المصروفات أو ارفع هامش الربح.`}
     </div>`;
 }
 
@@ -1293,7 +1398,8 @@ window.loadSettingsToForm = function() {
     'set-company-name': s.companyName, 'set-company-branch': s.companyBranch,
     'set-company-address': s.companyAddress, 'set-company-phone': s.companyPhone,
     'set-tax-number': s.taxNumber, 'set-currency': s.currency,
-    'set-logo-emoji': s.logoEmoji, 'set-meter-price': s.meterPrice, 'set-vat-rate': s.vatRate
+    'set-logo-emoji': s.logoEmoji, 'set-meter-price': s.meterPrice,
+    'set-client-meter-price': s.clientMeterPrice, 'set-vat-rate': s.vatRate
   };
   Object.entries(map).forEach(([id,val]) => { const el = document.getElementById(id); if (el) el.value = val ?? ''; });
 };
@@ -1301,7 +1407,12 @@ window.loadSettingsToForm = function() {
 window.saveCompanySettings = function() {
   if (currentRole !== 'admin') { toast('⛔ صلاحية المدير مطلوبة','err'); return; }
   const meterPrice = parseFloat(document.getElementById('set-meter-price').value);
-  if (isNaN(meterPrice) || meterPrice <= 0) { toast('⚠ سعر المتر يجب أن يكون رقماً موجباً','err'); return; }
+  if (isNaN(meterPrice) || meterPrice <= 0) { toast('⚠ سعر التكلفة (الدفع للسائق) يجب أن يكون رقماً موجباً','err'); return; }
+  const clientMeterPrice = parseFloat(document.getElementById('set-client-meter-price').value);
+  if (isNaN(clientMeterPrice) || clientMeterPrice <= 0) { toast('⚠ سعر البيع للشركة يجب أن يكون رقماً موجباً','err'); return; }
+  if (clientMeterPrice < meterPrice) {
+    if (!confirm(`⚠ تنبيه: سعر البيع (${clientMeterPrice}) أقل من سعر التكلفة (${meterPrice}) — سيؤدي إلى خسارة في كل متر. هل أنت متأكد؟`)) return;
+  }
   const vatRate = parseFloat(document.getElementById('set-vat-rate').value);
   const newSettings = {
     companyName: (document.getElementById('set-company-name').value || '').trim() || 'شركتي',
@@ -1312,6 +1423,7 @@ window.saveCompanySettings = function() {
     currency: (document.getElementById('set-currency').value || '').trim() || 'ر.س',
     logoEmoji: (document.getElementById('set-logo-emoji').value || '').trim() || '🏦',
     meterPrice: meterPrice,
+    clientMeterPrice: clientMeterPrice,
     vatRate: isNaN(vatRate) ? 15 : vatRate,
     fiscalYearStart: '01-01',
   };
@@ -1586,6 +1698,22 @@ td.td-bn{color:var(--red);font-weight:800;background:var(--red2)}
 .pnl-l{font-size:.66rem;font-weight:700;color:var(--text3);margin-bottom:5px}
 .pnl-v{font-size:1.3rem;font-weight:900;line-height:1.1}
 .pnl-sub{font-size:.65rem;color:var(--text3);margin-top:3px}
+
+/* PNL STATEMENT — قائمة الأرباح والخسائر بشكل تقرير محاسبي رسمي */
+.pnl-statement{background:var(--surface);border:1px solid var(--line);border-radius:var(--r);overflow:hidden;margin-bottom:12px}
+.pnl-section{padding:10px 14px;border-bottom:1px dashed var(--line)}
+.pnl-section:last-child{border-bottom:none}
+.pnl-section-h{font-size:.78rem;font-weight:800;color:var(--text);margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid var(--line)}
+.pnl-line{display:flex;justify-content:space-between;align-items:center;padding:6px 0;font-size:.8rem;color:var(--text2);gap:8px;flex-wrap:wrap}
+.pnl-line > span:first-child{flex:1;min-width:0}
+.pnl-line > span:last-child{text-align:left;white-space:nowrap}
+.pnl-subtotal{border-top:1px solid var(--line);margin-top:4px;padding-top:8px;font-weight:800;color:var(--text)}
+.pnl-gross{background:var(--b100);padding:12px 14px;font-size:.95rem;font-weight:900;color:var(--b600);border-top:2px solid var(--b400);border-bottom:1px solid var(--line)}
+body.dark-mode .pnl-gross{background:rgba(37,99,235,.12)}
+.pnl-net{background:linear-gradient(135deg,var(--b900),var(--b700));color:#fff;padding:14px;font-size:1rem;font-weight:900;display:flex;justify-content:space-between;align-items:center}
+.pnl-net > span:last-child{font-size:1.1rem}
+.pnl-bd-row{display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:.77rem;color:var(--text2)}
+.pnl-summary{background:var(--paper);border:1px solid var(--line);border-radius:var(--r2);padding:10px 14px;font-size:.78rem;color:var(--text2);line-height:1.7}
 
 /* STICKY TABLE HEADERS — رأس الجدول مثبت أثناء التمرير */
 .scroll-x{overflow-x:auto;max-height:65vh;overflow-y:auto}
@@ -2077,9 +2205,19 @@ body.dark-mode .shift-cur-meta{color:#86efac}
             <div><label>نسبة الضريبة (%)</label><input type="number" id="set-vat-rate" placeholder="15" step="0.1"></div>
           </div>
           <div style="margin-top:14px;padding-top:14px;border-top:1px dashed var(--line)">
-            <div style="font-size:.85rem;font-weight:800;color:var(--text);margin-bottom:10px">💵 المتغيرات المالية القابلة للتعديل</div>
+            <div style="font-size:.85rem;font-weight:800;color:var(--text);margin-bottom:6px">💵 أسعار الأمتار (المدخلات الأساسية للربحية)</div>
+            <div style="font-size:.72rem;color:var(--text3);margin-bottom:10px;line-height:1.6">سعر التكلفة = ما تدفعه للسائق عن كل متر. سعر البيع = ما تستلمه من الشركة الرئيسية عن كل متر. الفرق بينهما هو ربحك الإجمالي من كل متر.</div>
             <div class="fg">
-              <div><label>سعر المتر (يُستخدم في حساب الأمتار)</label><input type="number" id="set-meter-price" placeholder="14" min="0" step="0.01"></div>
+              <div>
+                <label>سعر الدفع للسائق (تكلفة المتر)</label>
+                <input type="number" id="set-meter-price" placeholder="14" min="0" step="0.01">
+                <div style="font-size:.65rem;color:var(--red);margin-top:3px">💸 يُخصم من الصندوق عند تسجيل سند أمتار</div>
+              </div>
+              <div>
+                <label>سعر البيع للشركة الرئيسية</label>
+                <input type="number" id="set-client-meter-price" placeholder="15" min="0" step="0.01">
+                <div style="font-size:.65rem;color:var(--green);margin-top:3px">📈 يُستخدم لحساب الإيرادات في تقرير الأرباح</div>
+              </div>
             </div>
           </div>
           <div class="br" style="margin-top:14px;display:flex;gap:8px">
