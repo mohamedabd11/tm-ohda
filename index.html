@@ -194,6 +194,7 @@ window.doLogin = async function() {
 window.doLogout = async function() {
   if (!confirm('هل تريد الخروج من النظام؟')) return;
   if (unsubEntries) { unsubEntries(); unsubEntries = null; }
+  if (unsubShifts) { unsubShifts(); unsubShifts = null; }
   await signOut(auth);
 };
 
@@ -212,7 +213,7 @@ function showApp(displayName) {
   set('tb-role-lbl', {admin:'مدير النظام', editor:'محرر', viewer:'مراقب'}[currentRole] || currentRole);
   const av = document.getElementById('tb-avatar'); if (av) av.textContent = displayName.charAt(0).toUpperCase();
 
-  applyPermissions(); subscribeToEntries();
+  applyPermissions(); subscribeToEntries(); subscribeToShifts();
   
   const firstPage = currentPages[0] || 'pg-dash';
   const btn = document.querySelector(`.sb-item[data-page="${firstPage}"]`); if (btn) showPage(btn);
@@ -255,6 +256,7 @@ function subscribeToEntries() {
 // CORE CRUD OPERATIONS
 // ══════════════════════════════════════════════
 window.addMeter = async function() {
+  if (!ensureShiftOpen()) return;
   const date = document.getElementById('m-date').value, ref = document.getElementById('m-ref').value.trim() || nextVoucherNumber('meter');
   const plate = document.getElementById('m-plate').value.trim(), meters = parseFloat(document.getElementById('m-meters').value);
   const time = document.getElementById('m-time').value, desc = document.getElementById('m-desc').value.trim(), notes = document.getElementById('m-notes').value.trim();
@@ -262,9 +264,10 @@ window.addMeter = async function() {
   if (!date || isNaN(meters) || meters <= 0) { toast('⚠ أدخل التاريخ وعدد الأمتار الصحيح','err'); return; }
   const crd = +(meters * getSetting('meterPrice')).toFixed(2);
   const noteFull = [plate?`لوحة: ${plate}`:'', time?`الوقت: ${time}`:'', notes].filter(Boolean).join(' | ');
+  const shiftId = window.currentOpenShift?.id || null;
   try {
     await addDoc(collection(db, 'entries'), {
-      date, ref, costCenter, met: meters, deb: 0, crd, desc: desc || (plate ? `قراءة أمتار — لوحة ${plate}` : 'قراءة أمتار'), notes: noteFull, type: 'meter', meterPrice: getSetting('meterPrice'), createdBy: currentUser.email, createdByName: document.getElementById('tb-username').textContent, createdAt: new Date().toISOString(), editHistory: []
+      date, ref, costCenter, met: meters, deb: 0, crd, desc: desc || (plate ? `قراءة أمتار — لوحة ${plate}` : 'قراءة أمتار'), notes: noteFull, type: 'meter', meterPrice: getSetting('meterPrice'), shiftId, createdBy: currentUser.email, createdByName: document.getElementById('tb-username').textContent, createdAt: new Date().toISOString(), editHistory: []
     });
     clrForm('m');
     const r=document.getElementById('m-ref'); if(r) r.value = nextVoucherNumber('meter');
@@ -273,6 +276,7 @@ window.addMeter = async function() {
 };
 
 window.addCustody = async function() {
+  if (!ensureShiftOpen()) return;
   const date = document.getElementById('c-date').value, ref = document.getElementById('c-ref').value.trim() || nextVoucherNumber('custody');
   const desc = document.getElementById('c-desc').value.trim(), amt = parseFloat(document.getElementById('c-amount').value);
   const notes = document.getElementById('c-notes').value.trim();
@@ -280,12 +284,13 @@ window.addCustody = async function() {
   if (!date || isNaN(amt) || amt <= 0) { toast('⚠ أدخل التاريخ والمبلغ بشكل صحيح','err'); return; }
   const cType = window._cType || 'r';
   const isR = cType === 'r'; const isAdv = cType === 'adv';
+  const shiftId = window.currentOpenShift?.id || null;
   try {
     await addDoc(collection(db, 'entries'), {
       date, ref, costCenter, met: 0, deb: isR ? amt : 0, crd: (!isR) ? amt : 0,
       desc: desc || (isR ? 'استلام عهدة' : isAdv ? 'سلفة مؤقتة' : 'تسليم عهدة'),
       notes, type: isAdv ? 'adv' : (isR ? 'custody_r' : 'custody_d'), payMethod: window._cPayMethod || 'cash',
-      createdBy: currentUser.email, createdByName: document.getElementById('tb-username').textContent, createdAt: new Date().toISOString(), editHistory: []
+      shiftId, createdBy: currentUser.email, createdByName: document.getElementById('tb-username').textContent, createdAt: new Date().toISOString(), editHistory: []
     });
     clrForm('c');
     const r=document.getElementById('c-ref'); if(r) r.value = nextVoucherNumber('custody');
@@ -294,6 +299,7 @@ window.addCustody = async function() {
 };
 
 window.addExpense = async function() {
+  if (!ensureShiftOpen()) return;
   const date = document.getElementById('e-date').value, ref = document.getElementById('e-ref').value.trim() || nextVoucherNumber('expense');
   const costCenter = document.getElementById('e-cost-center').value.trim(), desc = document.getElementById('e-desc').value.trim();
   const amt = parseFloat(document.getElementById('e-amount').value), notes = document.getElementById('e-notes').value.trim();
@@ -316,9 +322,10 @@ window.addExpense = async function() {
       const uploadTask = await uploadBytesResumable(storageRef, file);
       receiptUrl = await getDownloadURL(uploadTask.ref);
     }
+    const shiftId = window.currentOpenShift?.id || null;
     await addDoc(collection(db, 'entries'), {
       date, ref, costCenter, met: 0, deb: 0, crd: amt, desc: desc || typeLabel, notes, type: 'expense', et: finalType, etLabel: typeLabel, receiptUrl,
-      createdBy: currentUser.email, createdByName: document.getElementById('tb-username').textContent, createdAt: new Date().toISOString(), editHistory: []
+      shiftId, createdBy: currentUser.email, createdByName: document.getElementById('tb-username').textContent, createdAt: new Date().toISOString(), editHistory: []
     });
     clrForm('e');
     const r=document.getElementById('e-ref'); if(r) r.value = nextVoucherNumber('expense');
@@ -889,91 +896,323 @@ window.saveEditPermissions = async function() {
 };
 
 // ══════════════════════════════════════════════
-// SHIFT CLOSURE (إقفال الوردية)
+// SHIFT MANAGEMENT — نظام الورديات الاحترافي
 // ══════════════════════════════════════════════
-window.openShiftClosure = function() {
-  const wrap = document.getElementById('shift-user-wrap'); const sel = document.getElementById('shift-user-select');
+// كل مستخدم يمكنه فتح وردية واحدة فقط، وكل حركة تُضاف تنتمي تلقائياً لوردية المستخدم المفتوحة.
+// الرصيد الافتتاحي للوردية = إجمالي حركات المستخدم قبل لحظة فتح الوردية.
+
+window.currentOpenShift = null;
+window.allShifts = [];
+let unsubShifts = null;
+
+// التحقق من وجود وردية مفتوحة قبل إضافة أي حركة
+function ensureShiftOpen() {
+  if (window.currentOpenShift) return true;
+  // المدير يستطيع الإضافة بدون وردية (للحركات الإدارية)
   if (currentRole === 'admin') {
-    wrap.style.display = 'block'; const userMap = {};
-    userMap[currentUser.email] = (document.getElementById('tb-username').textContent || currentUser.email) + ' (ورديتي)';
-    DB_entries.forEach(e => { if (e.createdBy && !userMap[e.createdBy]) userMap[e.createdBy] = e.createdByName || e.createdBy; });
-    sel.innerHTML = Object.entries(userMap).map(([email, name]) => `<option value="${email}">${name}</option>`).join('');
-    sel.value = currentUser.email; 
-  } else wrap.style.display = 'none';
-  updateShiftView(); document.getElementById('shift-mo').classList.add('open');
-};
+    if (!confirm('ليس لديك وردية مفتوحة. هل تريد الاستمرار بإضافة الحركة كحركة إدارية بدون ربطها بوردية؟')) return false;
+    return true;
+  }
+  toast('⚠ افتح وردية جديدة قبل تسجيل أي حركة (من صفحة إقفال الوردية)','err');
+  return false;
+}
 
-window.updateShiftView = function() {
-  const sel = document.getElementById('shift-user-select');
-  const targetEmail = currentRole === 'admin' ? (sel.value || currentUser.email) : currentUser.email;
-  const targetEntries = DB_entries.filter(e => e.createdBy === targetEmail);
-  const bal = targetEntries.reduce((s,e)=>s+(e.deb||0)-(e.crd||0),0);
-  window._shiftTargetEmail = targetEmail; window._shiftTargetBal = bal; window._shiftTargetEntries = targetEntries;
-  document.getElementById('shift-system-bal').textContent = fEN(bal)+' ر.س';
-  document.getElementById('shift-actual-amt').value = ''; document.getElementById('shift-notes').value = ''; document.getElementById('shift-variance-row').style.display = 'none';
-};
-
-window.calcShiftVariance = function() {
-  const bal = window._shiftTargetBal || 0; const actualEl = document.getElementById('shift-actual-amt');
-  const row = document.getElementById('shift-variance-row'); const varVal = document.getElementById('shift-variance-val'); const varLbl = document.getElementById('shift-variance-lbl');
-  if(actualEl.value === ''){ row.style.display='none'; return; }
-  const actual = parseFloat(actualEl.value)||0; const variance = +(actual - bal).toFixed(2);
-  row.style.display = 'block';
-  varVal.textContent = (variance>=0?'+':'')+fEN(variance)+' ر.س'; varVal.style.color = variance===0?'var(--green)':variance>0?'var(--green)':'var(--red)';
-  varLbl.textContent = variance===0?'✅ الرصيد مطابق':variance>0?'🟢 زيادة':'🔴 عجز';
-};
-
-window.saveShiftClosure = async function() {
-  const bal = window._shiftTargetBal || 0; const targetEmail = window._shiftTargetEmail || currentUser.email; const targetEntries = window._shiftTargetEntries || [];
-  const actual = parseFloat(document.getElementById('shift-actual-amt').value), notes = document.getElementById('shift-notes').value.trim();
-  if(isNaN(actual)||actual<0){ toast('⚠ أدخل المبلغ الفعلي للصندوق','err'); return; }
-  const variance = +(actual-bal).toFixed(2);
-  const btn = document.getElementById('shift-save-btn'); btn.textContent='جاري الحفظ...'; btn.disabled=true;
-  
-  const userBreakdown = {};
-  targetEntries.forEach(e => {
-    const k = e.createdByName || e.createdBy || 'غير معروف';
-    if (!userBreakdown[k]) userBreakdown[k] = { deb:0, crd:0, count:0, meters:0 };
-    userBreakdown[k].deb += (e.deb||0); userBreakdown[k].crd += (e.crd||0); userBreakdown[k].count += 1; userBreakdown[k].meters+= (e.met||0);
+function subscribeToShifts() {
+  if (unsubShifts) unsubShifts();
+  unsubShifts = onSnapshot(collection(db, 'shifts'), (snap) => {
+    window.allShifts = [];
+    snap.forEach(d => window.allShifts.push({ id: d.id, ...d.data() }));
+    // الوردية المفتوحة الحالية للمستخدم
+    window.currentOpenShift = window.allShifts.find(s => s.status === 'open' && s.userId === currentUser?.email) || null;
+    // إعادة عرض شاشة الورديات إن كانت مفتوحة
+    if (document.getElementById('pg-shifts')?.classList.contains('active')) renderShiftsPage();
+    // تحديث مؤشر حالة الوردية في الشريط العلوي
+    updateShiftIndicator();
   });
-  
-  let targetName = targetEmail; const sel = document.getElementById('shift-user-select');
-  if(currentRole === 'admin' && sel.options[sel.selectedIndex]) targetName = sel.options[sel.selectedIndex].text.replace(' (ورديتي)', '');
-  else targetName = document.getElementById('tb-username').textContent;
+}
 
+// مؤشر صغير يُظهر هل يوجد وردية مفتوحة أم لا
+function updateShiftIndicator() {
+  const ind = document.getElementById('shift-indicator'); if (!ind) return;
+  if (window.currentOpenShift) {
+    ind.innerHTML = '🟢 وردية مفتوحة'; ind.style.background = 'var(--green2)'; ind.style.color = 'var(--green)'; ind.title = 'لديك وردية مفتوحة حالياً';
+  } else {
+    ind.innerHTML = '⚪ لا توجد وردية مفتوحة'; ind.style.background = 'var(--surface)'; ind.style.color = 'var(--text3)'; ind.title = 'افتح وردية قبل بدء العمل';
+  }
+}
+
+// حساب الرصيد التراكمي لمستخدم حتى لحظة معينة (بـ ISO timestamp)
+function balanceUpTo(userEmail, isoTime) {
+  let bal = 0;
+  DB_entries.forEach(e => {
+    if (e.createdBy !== userEmail) return;
+    if (e.createdAt && e.createdAt < isoTime) bal += (e.deb||0) - (e.crd||0);
+  });
+  return bal;
+}
+
+// إجمالي حركات وردية محددة
+function shiftEntriesOf(shift) {
+  if (!shift) return [];
+  return DB_entries.filter(e => {
+    if (e.createdBy !== shift.userId) return false;
+    if (!e.createdAt) return false;
+    if (e.createdAt < shift.openedAt) return false;
+    if (shift.closedAt && e.createdAt > shift.closedAt) return false;
+    return true;
+  });
+}
+
+function shiftTotalsOf(shift) {
+  const entries = shiftEntriesOf(shift);
+  let deb=0, crd=0, met=0;
+  entries.forEach(e => { deb+=(e.deb||0); crd+=(e.crd||0); met+=(e.met||0); });
+  return { entries, deb, crd, met, count: entries.length };
+}
+
+// ━━━ فتح وردية جديدة ━━━
+window.openNewShift = async function() {
+  if (!currentUser) return;
+  if (window.currentOpenShift) { toast('⚠ لديك وردية مفتوحة بالفعل — أقفلها أولاً','err'); return; }
+  if (!confirm('بدء وردية جديدة الآن؟ سيتم تسجيل وقت البداية والرصيد الافتتاحي.')) return;
+  const btn = document.getElementById('open-shift-btn'); if (btn){btn.textContent='جاري الفتح...';btn.disabled=true;}
+  const now = new Date().toISOString();
+  // الرصيد الافتتاحي = الرصيد التراكمي للمستخدم قبل هذه اللحظة
+  const openingBalance = balanceUpTo(currentUser.email, now);
   try {
-    await addDoc(collection(db,'shifts'),{
-      userId: targetEmail, userName: targetName, userEmail: targetEmail, closedBy: currentUser.email, systemBalance: +bal.toFixed(2), totalBalance: +bal.toFixed(2), actualAmount: +actual.toFixed(2), variance,
-      status: variance===0?'matched':variance>0?'surplus':'deficit', notes, entriesCount: targetEntries.length, userBreakdown, closedAt: new Date().toISOString(), closedDate: new Date().toISOString().split('T')[0]
+    await addDoc(collection(db, 'shifts'), {
+      status: 'open',
+      userId: currentUser.email,
+      userName: document.getElementById('tb-username').textContent || currentUser.email,
+      userEmail: currentUser.email,
+      openedAt: now,
+      openedDate: now.split('T')[0],
+      openedBy: currentUser.email,
+      openingBalance: +openingBalance.toFixed(2),
+    });
+    toast('🌅 تم فتح الوردية بنجاح','ok');
+  } catch(e) { toast('⚠ خطأ في فتح الوردية','err'); }
+  if (btn){btn.textContent='🌅 بداية وردية جديدة';btn.disabled=false;}
+};
+
+// ━━━ فتح modal الإقفال (يُعرض بيانات الوردية الحالية) ━━━
+window.openCloseShiftModal = function() {
+  const shift = window.currentOpenShift;
+  if (!shift) { toast('⚠ ليس لديك وردية مفتوحة لإقفالها','err'); return; }
+  const t = shiftTotalsOf(shift);
+  const systemBalance = (shift.openingBalance||0) + t.deb - t.crd;
+  // عرض البيانات
+  document.getElementById('shift-modal-opened-at').textContent = new Date(shift.openedAt).toLocaleString('ar-SA',{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+  document.getElementById('shift-modal-opening').textContent = fEN(shift.openingBalance||0) + ' ' + CUR();
+  document.getElementById('shift-modal-deb').textContent = fEN(t.deb);
+  document.getElementById('shift-modal-crd').textContent = fEN(t.crd);
+  document.getElementById('shift-modal-count').textContent = t.count + ' حركة';
+  const sbEl = document.getElementById('shift-modal-system');
+  sbEl.textContent = fEN(systemBalance) + ' ' + CUR();
+  sbEl.style.color = systemBalance >= 0 ? 'var(--green)' : 'var(--red)';
+  document.getElementById('shift-actual-amt').value = '';
+  document.getElementById('shift-notes').value = '';
+  document.getElementById('shift-variance-row').style.display = 'none';
+  window._shiftClosingSystemBal = systemBalance;
+  window._shiftClosingId = shift.id;
+  document.getElementById('shift-mo').classList.add('open');
+};
+
+// ━━━ حساب الفرق فورياً عند الكتابة ━━━
+window.calcShiftVariance = function() {
+  const bal = window._shiftClosingSystemBal || 0;
+  const actualEl = document.getElementById('shift-actual-amt');
+  const row = document.getElementById('shift-variance-row');
+  const varVal = document.getElementById('shift-variance-val');
+  const varLbl = document.getElementById('shift-variance-lbl');
+  if (actualEl.value === '') { row.style.display='none'; return; }
+  const actual = parseFloat(actualEl.value) || 0;
+  const variance = +(actual - bal).toFixed(2);
+  row.style.display = 'block';
+  varVal.textContent = (variance>=0?'+':'') + fEN(variance) + ' ' + CUR();
+  varVal.style.color = variance===0?'var(--green)':variance>0?'var(--green)':'var(--red)';
+  varLbl.textContent = variance===0?'✅ مطابق':variance>0?'🟢 زيادة':'🔴 عجز';
+};
+
+// ━━━ تأكيد الإقفال ━━━
+window.saveShiftClosure = async function() {
+  const shiftId = window._shiftClosingId;
+  if (!shiftId) { toast('⚠ لا توجد وردية محددة للإقفال','err'); return; }
+  const shift = window.allShifts.find(s => s.id === shiftId);
+  if (!shift) { toast('⚠ الوردية لم تعد موجودة','err'); return; }
+  const actual = parseFloat(document.getElementById('shift-actual-amt').value);
+  if (isNaN(actual) || actual < 0) { toast('⚠ أدخل المبلغ الفعلي للصندوق','err'); return; }
+  const notes = document.getElementById('shift-notes').value.trim();
+  const t = shiftTotalsOf(shift);
+  const systemBalance = (shift.openingBalance||0) + t.deb - t.crd;
+  const variance = +(actual - systemBalance).toFixed(2);
+  const btn = document.getElementById('shift-save-btn'); btn.textContent='جاري الحفظ...'; btn.disabled=true;
+  try {
+    await updateDoc(doc(db, 'shifts', shiftId), {
+      status: 'closed',
+      closedAt: new Date().toISOString(),
+      closedDate: new Date().toISOString().split('T')[0],
+      closedBy: currentUser.email,
+      actualAmount: +actual.toFixed(2),
+      systemBalance: +systemBalance.toFixed(2),
+      variance,
+      varianceStatus: variance===0?'matched':variance>0?'surplus':'deficit',
+      shiftDeb: +t.deb.toFixed(2),
+      shiftCrd: +t.crd.toFixed(2),
+      shiftMet: +t.met.toFixed(2),
+      entriesCount: t.count,
+      notes,
     });
     closeMo('shift-mo');
-    toast(variance===0 ? '✅ تم الإقفال والمطابقة بنجاح' : variance>0 ? `✅ تم الإقفال — بزيادة ${fEN(variance)} ر.س` : `✅ تم الإقفال — بعجز ${fEN(Math.abs(variance))} ر.س`,'ok');
-    if(document.getElementById('pg-shifts').classList.contains('active')) renderShifts();
-  } catch(e){ toast('⚠ خطأ في الحفظ','err'); }
+    toast(variance===0 ? '✅ تم الإقفال والمطابقة بنجاح' : variance>0 ? `✅ تم الإقفال — بزيادة ${fEN(variance)} ${CUR()}` : `✅ تم الإقفال — بعجز ${fEN(Math.abs(variance))} ${CUR()}`, 'ok');
+  } catch(e) { toast('⚠ خطأ في الحفظ','err'); }
   btn.textContent='🔒 تأكيد الإقفال'; btn.disabled=false;
 };
 
-window.deleteShiftRecord = async function(shiftId) {
-  if (!confirm('حذف سجل الإقفال نهائياً؟')) return;
-  try { await deleteDoc(doc(db, 'shifts', shiftId)); toast('✅ تم الحذف','ok'); renderShifts(); } catch(e) { toast('⚠ خطأ في الحذف','err'); }
+// ━━━ عرض تفاصيل وردية محددة (للمدير والمستخدم) ━━━
+window.viewShiftDetails = function(shiftId) {
+  const shift = window.allShifts.find(s => s.id === shiftId);
+  if (!shift) return;
+  const t = shiftTotalsOf(shift);
+  const isOpen = shift.status === 'open';
+  const systemBalance = (shift.openingBalance||0) + t.deb - t.crd;
+  document.getElementById('sd-title').textContent = `📋 تفاصيل وردية ${shift.userName}`;
+  document.getElementById('sd-meta').innerHTML = `
+    <div class="sd-grid">
+      <div><span>الحالة</span><strong style="color:${isOpen?'var(--green)':'var(--text3)'}">${isOpen?'🟢 مفتوحة':'🔒 مقفلة'}</strong></div>
+      <div><span>المستخدم</span><strong>${shift.userName}</strong></div>
+      <div><span>فُتحت</span><strong>${new Date(shift.openedAt).toLocaleString('ar-SA',{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</strong></div>
+      ${!isOpen ? `<div><span>أُقفلت</span><strong>${new Date(shift.closedAt).toLocaleString('ar-SA',{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}</strong></div>` : ''}
+      <div><span>الرصيد الافتتاحي</span><strong>${fEN(shift.openingBalance||0)} ${CUR()}</strong></div>
+      <div><span>وارد الوردية</span><strong style="color:var(--green)">${fEN(t.deb)}</strong></div>
+      <div><span>صادر الوردية</span><strong style="color:var(--red)">${fEN(t.crd)}</strong></div>
+      <div><span>أمتار الوردية</span><strong style="color:var(--b600)">${fEN(t.met)} م</strong></div>
+      <div><span>الرصيد ${isOpen?'الحالي':'النظامي'}</span><strong style="color:${systemBalance>=0?'var(--green)':'var(--red)'}">${fEN(systemBalance)} ${CUR()}</strong></div>
+      ${!isOpen ? `<div><span>المبلغ الفعلي</span><strong>${fEN(shift.actualAmount||0)} ${CUR()}</strong></div>` : ''}
+      ${!isOpen ? `<div><span>الفارق</span><strong style="color:${(shift.variance||0)>=0?'var(--green)':'var(--red)'}">${(shift.variance||0)>=0?'+':''}${fEN(shift.variance||0)} ${CUR()}</strong></div>` : ''}
+    </div>
+    ${shift.notes ? `<div class="sd-notes">📝 ${shift.notes}</div>` : ''}
+  `;
+  // قائمة الحركات
+  if (!t.entries.length) {
+    document.getElementById('sd-entries').innerHTML = '<p style="text-align:center;color:var(--text3);padding:14px">لا توجد حركات في هذه الوردية</p>';
+  } else {
+    const isAdmin = currentRole === 'admin';
+    let bal = shift.openingBalance || 0;
+    const sortedAsc = [...t.entries].sort((a,b) => (a.createdAt||'').localeCompare(b.createdAt||''));
+    const rowsHTML = sortedAsc.map(e => {
+      bal += (e.deb||0) - (e.crd||0);
+      const lbl = e.type==='expense' ? (e.etLabel||EL[e.et]||'أخرى') : (TL[e.type]||e.type);
+      const acts = isAdmin ? `<td><button class="eb" onclick="openEdit('${e.id}')" title="تعديل">✏️</button> <button onclick="confirmDel('${e.id}')" title="حذف">🗑</button></td>` : '<td></td>';
+      return `<tr><td>${new Date(e.createdAt).toLocaleTimeString('ar-SA',{hour:'2-digit',minute:'2-digit'})}</td><td>${lbl}</td><td style="text-align:right">${e.desc||'—'}</td><td class="td-deb">${e.deb?fEN(e.deb):''}</td><td class="td-crd">${e.crd?fEN(e.crd):''}</td><td class="${bal>=0?'td-bp':'td-bn'}">${fEN(bal)}</td>${acts}</tr>`;
+    }).join('');
+    document.getElementById('sd-entries').innerHTML = `<div class="scroll-x"><table style="width:100%;font-size:.78rem"><thead><tr><th>الوقت</th><th>النوع</th><th>البيان</th><th>وارد</th><th>صادر</th><th>الرصيد</th>${isAdmin?'<th>⚙</th>':'<th></th>'}</tr></thead><tbody>${rowsHTML}</tbody></table></div>`;
+  }
+  document.getElementById('shift-details-mo').classList.add('open');
 };
 
-window.renderShifts = async function() {
-  const el = document.getElementById('shifts-list'); if(!el) return;
-  el.innerHTML='<div style="padding:24px;text-align:center;color:var(--text3);font-size:.82rem">جاري التحميل...</div>';
-  try {
-    const snap = await getDocs(collection(db,'shifts')); const shifts=[]; snap.forEach(d=>shifts.push({id:d.id,...d.data()}));
-    shifts.sort((a,b)=>(b.closedAt||'').localeCompare(a.closedAt||''));
-    if(!shifts.length){ el.innerHTML='<div style="padding:32px;text-align:center;color:var(--text3);font-size:.85rem">📋 لا توجد إقفالات مسجلة</div>'; return; }
-    el.innerHTML = shifts.map(s=>{
-      const ic = s.status==='matched'?'✅':s.status==='surplus'?'🟢':'🔴', lbl = s.status==='matched'?'مطابق':s.status==='surplus'?'زيادة':'عجز', bg = s.status==='matched'||s.status==='surplus'?'var(--green)':'var(--red)';
-      const varColor = s.status==='matched'||s.status==='surplus'?'var(--green)':'var(--red)';
-      const dt = s.closedAt ? new Date(s.closedAt).toLocaleString('ar-SA',{year:'numeric',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
-      const closedByText = s.closedBy && s.closedBy !== s.userEmail ? `<span style="font-size:0.65rem; color:var(--amber); display:block; margin-top:2px;">تم الإقفال بواسطة: ${s.closedBy}</span>` : '';
-      return `<div class="shift-row"><div class="shift-hd"><div><span class="shift-user" style="display:block">👤 ${s.userName||s.userEmail||'—'}</span>${closedByText}</div><span class="shift-badge" style="background:${bg}">${ic} ${lbl}</span></div><div class="shift-time">🕐 ${dt}</div><div class="shift-stats"><div class="sst"><div class="sst-l">الرصيد النظامي</div><div class="sst-v">${fEN(s.systemBalance||0)} ر.س</div></div><div class="sst"><div class="sst-l">المبلغ الفعلي</div><div class="sst-v">${fEN(s.actualAmount||0)} ر.س</div></div><div class="sst"><div class="sst-l">الفارق</div><div class="sst-v" style="color:${varColor};font-weight:900">${((s.variance||0)>=0?'+':'')+fEN(s.variance||0)} ر.س</div></div></div>${s.userBreakdown && Object.keys(s.userBreakdown).length > 0 ? `<div style="margin-top:10px;border-top:1px solid var(--line);padding-top:10px"><div style="font-size:.68rem;font-weight:700;color:var(--text3);margin-bottom:6px;">📊 تفصيل حسب المستخدم</div><div style="display:grid;gap:5px">${Object.entries(s.userBreakdown).map(([name,d])=>`<div style="display:flex;align-items:center;justify-content:space-between;background:var(--surface);border:1px solid var(--line);border-radius:6px;padding:6px 10px;font-size:.75rem"><span style="font-weight:700;color:var(--text)">👤 ${name}</span><span style="color:var(--text3)">${d.count} حركة</span><span style="color:var(--green);font-weight:700">${d.deb?fEN(d.deb)+' ↑':''}</span><span style="color:var(--red);font-weight:700">${d.crd?fEN(d.crd)+' ↓':''}</span></div>`).join('')}</div></div>` : ''}${s.notes?`<div class="shift-note">📝 ${s.notes}</div>`:''}<div style="display:flex;gap:6px;margin-top:10px"><button onclick="deleteShiftRecord('${s.id}')" style="background:var(--red2);color:var(--red);border:1px solid rgba(185,28,28,.2);border-radius:6px;padding:5px 12px;font-size:.75rem;font-weight:700;cursor:pointer">🗑 حذف الإقفال</button></div></div>`;
-    }).join('');
-  } catch(e){ el.innerHTML='<div style="padding:24px;text-align:center;color:var(--red);font-size:.82rem">⛔ ليس لديك صلاحية لعرض الإقفالات</div>'; }
+window.deleteShiftRecord = async function(shiftId) {
+  if (currentRole !== 'admin') { toast('⛔ صلاحية المدير مطلوبة','err'); return; }
+  if (!confirm('حذف سجل هذه الوردية نهائياً؟ (لن يتم حذف الحركات المُلحقة بها)')) return;
+  try { await deleteDoc(doc(db, 'shifts', shiftId)); toast('✅ تم الحذف','ok'); } catch(e) { toast('⚠ خطأ في الحذف','err'); }
 };
+
+window.reopenShift = async function(shiftId) {
+  if (currentRole !== 'admin') { toast('⛔ صلاحية المدير مطلوبة','err'); return; }
+  const shift = window.allShifts.find(s => s.id === shiftId); if (!shift) return;
+  // التحقق من عدم وجود وردية مفتوحة أخرى لنفس المستخدم
+  const otherOpen = window.allShifts.find(s => s.status === 'open' && s.userId === shift.userId && s.id !== shiftId);
+  if (otherOpen) { toast('⚠ يوجد وردية مفتوحة لنفس المستخدم — أقفلها أولاً','err'); return; }
+  if (!confirm('إعادة فتح هذه الوردية؟ ستعود الحركات الجديدة لها.')) return;
+  try { await updateDoc(doc(db,'shifts',shiftId),{ status:'open', reopenedAt:new Date().toISOString(), reopenedBy:currentUser.email }); toast('✅ تمت إعادة الفتح','ok'); }
+  catch(e) { toast('⚠ خطأ','err'); }
+};
+
+// ━━━ عرض الصفحة كاملة ━━━
+window.renderShiftsPage = function() {
+  const currentEl = document.getElementById('shift-current-card');
+  const listEl = document.getElementById('shifts-list');
+  const openBtnWrap = document.getElementById('shift-open-btn-wrap');
+  if (!currentEl || !listEl) return;
+
+  // 1) بطاقة الوردية الحالية للمستخدم
+  if (window.currentOpenShift) {
+    const t = shiftTotalsOf(window.currentOpenShift);
+    const systemBalance = (window.currentOpenShift.openingBalance||0) + t.deb - t.crd;
+    currentEl.style.display = '';
+    currentEl.innerHTML = `
+      <div class="shift-cur-hd">
+        <div><span class="shift-cur-status">🟢 وردية مفتوحة</span><div class="shift-cur-user">👤 ${window.currentOpenShift.userName}</div></div>
+        <div style="text-align:left"><div class="shift-cur-lbl">منذ</div><div class="shift-cur-time">${new Date(window.currentOpenShift.openedAt).toLocaleString('ar-SA',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'})}</div></div>
+      </div>
+      <div class="shift-cur-stats">
+        <div class="scs"><div class="scs-l">الرصيد الافتتاحي</div><div class="scs-v">${fEN(window.currentOpenShift.openingBalance||0)} ${CUR()}</div></div>
+        <div class="scs"><div class="scs-l">وارد الوردية</div><div class="scs-v" style="color:var(--green)">${fEN(t.deb)}</div></div>
+        <div class="scs"><div class="scs-l">صادر الوردية</div><div class="scs-v" style="color:var(--red)">${fEN(t.crd)}</div></div>
+        <div class="scs"><div class="scs-l">الرصيد الحالي</div><div class="scs-v" style="color:${systemBalance>=0?'var(--green)':'var(--red)'};font-weight:900">${fEN(systemBalance)} ${CUR()}</div></div>
+      </div>
+      <div class="shift-cur-meta">📊 ${t.count} حركة مسجلة • أمتار: ${fEN(t.met)} م</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-blue" onclick="viewShiftDetails('${window.currentOpenShift.id}')" style="flex:1;min-width:140px">👁️ عرض الحركات</button>
+        <button class="btn btn-green" onclick="openCloseShiftModal()" style="flex:1;min-width:140px">🔒 إقفال الوردية</button>
+      </div>
+    `;
+    if (openBtnWrap) openBtnWrap.style.display = 'none';
+  } else {
+    currentEl.style.display = 'none';
+    if (openBtnWrap) openBtnWrap.style.display = '';
+  }
+
+  // 2) قائمة الورديات السابقة (المدير يرى الكل، المستخدم يرى ورديته فقط)
+  const isAdmin = currentRole === 'admin';
+  let shifts = [...window.allShifts];
+  if (!isAdmin) shifts = shifts.filter(s => s.userId === currentUser.email);
+  // ترتيب: المفتوحة أولاً ثم الأحدث
+  shifts.sort((a,b) => {
+    if (a.status !== b.status) return a.status === 'open' ? -1 : 1;
+    return (b.openedAt||'').localeCompare(a.openedAt||'');
+  });
+  // إخفاء الوردية المفتوحة للمستخدم الحالي من القائمة (موجودة في البطاقة فوق)
+  const visibleShifts = shifts.filter(s => !(s.status==='open' && s.userId===currentUser.email));
+
+  if (!visibleShifts.length) {
+    listEl.innerHTML = '<div style="padding:32px;text-align:center;color:var(--text3);font-size:.85rem">📋 لا توجد ورديات سابقة بعد</div>';
+    return;
+  }
+  listEl.innerHTML = visibleShifts.map(s => {
+    const t = shiftTotalsOf(s);
+    const systemBal = (s.openingBalance||0) + t.deb - t.crd;
+    const isOpen = s.status === 'open';
+    const vStatus = s.varianceStatus || 'matched';
+    const badgeBg = isOpen ? 'var(--b500)' : vStatus==='matched'?'var(--green)':vStatus==='surplus'?'var(--green)':'var(--red)';
+    const badgeIcon = isOpen ? '🟢' : vStatus==='matched'?'✅':vStatus==='surplus'?'🟢':'🔴';
+    const badgeLbl = isOpen ? 'مفتوحة' : vStatus==='matched'?'مطابقة':vStatus==='surplus'?'زيادة':'عجز';
+    const openedTxt = new Date(s.openedAt).toLocaleString('ar-SA',{day:'numeric',month:'short',year:'numeric',hour:'2-digit',minute:'2-digit'});
+    const closedTxt = s.closedAt ? new Date(s.closedAt).toLocaleString('ar-SA',{day:'numeric',month:'short',hour:'2-digit',minute:'2-digit'}) : '—';
+    const variance = s.variance||0;
+    return `<div class="shift-row">
+      <div class="shift-hd">
+        <div><span class="shift-user" style="display:block">👤 ${s.userName||s.userEmail||'—'}</span>${s.closedBy && s.closedBy !== s.userEmail ? `<span style="font-size:.65rem;color:var(--amber);display:block;margin-top:2px">أقفل بواسطة: ${s.closedBy}</span>` : ''}</div>
+        <span class="shift-badge" style="background:${badgeBg}">${badgeIcon} ${badgeLbl}</span>
+      </div>
+      <div class="shift-time">🕐 من ${openedTxt}${!isOpen ? ' حتى ' + closedTxt : ''}</div>
+      <div class="shift-stats">
+        <div class="sst"><div class="sst-l">الافتتاحي</div><div class="sst-v">${fEN(s.openingBalance||0)}</div></div>
+        ${!isOpen ? `<div class="sst"><div class="sst-l">النظامي</div><div class="sst-v">${fEN(s.systemBalance||systemBal)}</div></div>` : `<div class="sst"><div class="sst-l">الحالي</div><div class="sst-v">${fEN(systemBal)}</div></div>`}
+        ${!isOpen ? `<div class="sst"><div class="sst-l">الفعلي</div><div class="sst-v">${fEN(s.actualAmount||0)}</div></div>` : `<div class="sst"><div class="sst-l">الحركات</div><div class="sst-v">${t.count}</div></div>`}
+        ${!isOpen ? `<div class="sst"><div class="sst-l">الفارق</div><div class="sst-v" style="color:${variance>=0?'var(--green)':'var(--red)'};font-weight:900">${(variance>=0?'+':'')+fEN(variance)}</div></div>` : ''}
+      </div>
+      ${s.notes ? `<div class="shift-note">📝 ${s.notes}</div>` : ''}
+      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap">
+        <button onclick="viewShiftDetails('${s.id}')" class="shift-act-btn">👁️ التفاصيل</button>
+        ${isAdmin && !isOpen ? `<button onclick="reopenShift('${s.id}')" class="shift-act-btn" style="background:var(--amber2);color:var(--amber)">🔓 إعادة فتح</button>` : ''}
+        ${isAdmin ? `<button onclick="deleteShiftRecord('${s.id}')" class="shift-act-btn" style="background:var(--red2);color:var(--red)">🗑 حذف الإقفال</button>` : ''}
+      </div>
+    </div>`;
+  }).join('');
+};
+// إعادة توجيه renderShifts القديمة إلى renderShiftsPage الجديدة
+window.renderShifts = window.renderShiftsPage;
 
 // ══════════════════════════════════════════════
 // UI HELPERS (المساعدات البصرية والتبويب)
@@ -1352,6 +1591,48 @@ thead th{position:sticky;top:0;z-index:5}
 .ctype.act-pay{border-color:var(--b500);background:var(--b100)}
 .ctype.act-pay .clbl{color:var(--b600)!important}
 
+/* SHIFT CURRENT CARD — بطاقة الوردية المفتوحة الحالية */
+.shift-cur-card{background:linear-gradient(135deg,var(--green2) 0%,#bbf7d0 100%);border:1.5px solid var(--green);border-radius:var(--r);padding:16px;margin-bottom:16px;box-shadow:var(--sh)}
+body.dark-mode .shift-cur-card{background:linear-gradient(135deg,rgba(22,101,52,.2) 0%,rgba(21,128,61,.15) 100%);border-color:var(--green)}
+.shift-cur-hd{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px}
+.shift-cur-status{display:inline-block;background:var(--green);color:#fff;font-size:.7rem;font-weight:800;padding:3px 10px;border-radius:14px}
+.shift-cur-user{font-size:.92rem;font-weight:800;color:var(--text);margin-top:6px}
+.shift-cur-lbl{font-size:.62rem;color:var(--text3);font-weight:700}
+.shift-cur-time{font-size:.78rem;color:var(--green3);font-weight:800}
+body.dark-mode .shift-cur-time{color:#86efac}
+.shift-cur-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:10px}
+@media(min-width:600px){.shift-cur-stats{grid-template-columns:repeat(4,1fr)}}
+.scs{background:rgba(255,255,255,.7);border:1px solid rgba(21,128,61,.15);border-radius:var(--r2);padding:8px;text-align:center}
+body.dark-mode .scs{background:rgba(15,23,42,.6);border-color:var(--line)}
+.scs-l{font-size:.62rem;color:var(--text3);margin-bottom:3px;font-weight:700}
+.scs-v{font-size:.95rem;font-weight:800;color:var(--text)}
+.shift-cur-meta{font-size:.7rem;color:var(--green3);font-weight:700;margin-bottom:12px;text-align:center}
+body.dark-mode .shift-cur-meta{color:#86efac}
+
+/* SHIFT MODAL INFO PANEL */
+.shift-modal-info{background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:12px;font-size:.82rem}
+.smi-row{display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px dashed var(--line)}
+.smi-row:last-child{border-bottom:none}
+.smi-row span{color:var(--text3);font-weight:600}
+.smi-row strong{color:var(--text);font-weight:800}
+.smi-total{background:var(--b100);margin:6px -12px -12px;padding:10px 12px;border-radius:0 0 var(--r2) var(--r2);border-bottom:none}
+.smi-total span{font-weight:800;color:var(--b600)}
+.smi-total strong{font-size:1.1rem;color:var(--b600);font-weight:900}
+
+/* SHIFT DETAILS MODAL META GRID */
+.sd-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.sd-grid > div{background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:8px 10px;font-size:.78rem;display:flex;justify-content:space-between;align-items:center}
+.sd-grid span{color:var(--text3);font-weight:600;font-size:.7rem}
+.sd-grid strong{font-weight:800;color:var(--text)}
+.sd-notes{margin-top:8px;background:var(--amber2);border:1px solid var(--amber);color:var(--amber);padding:8px 12px;border-radius:var(--r2);font-size:.78rem}
+
+/* SHIFT ACTION BUTTONS */
+.shift-act-btn{background:var(--surface);color:var(--b600);border:1px solid var(--line);border-radius:6px;padding:5px 12px;font-family:'Tajawal',sans-serif;font-size:.72rem;font-weight:700;cursor:pointer;transition:.15s}
+.shift-act-btn:hover{border-color:var(--b400);background:var(--b100)}
+
+/* SHIFT INDICATOR (topbar badge) */
+.shift-indicator{font-size:.65rem;font-weight:800;padding:4px 10px;border-radius:12px;background:var(--surface);color:var(--text3);cursor:pointer;border:1px solid var(--line);white-space:nowrap}
+
 /* SHIFT ROWS */
 .shift-row{background:var(--paper);border:1px solid var(--line);border-radius:var(--r);padding:14px 16px;margin-bottom:10px;transition:.15s}
 .shift-row:hover{box-shadow:var(--sh)}
@@ -1451,6 +1732,7 @@ thead th{position:sticky;top:0;z-index:5}
       <div><div class="tb-title" id="pg-title">الصفحة الرئيسية</div><div class="tb-subtitle" id="tb-date">—</div></div>
     </div>
     <div class="tb-right">
+      <span id="shift-indicator" class="shift-indicator" onclick="navTo('pg-shifts')" title="حالة الوردية">⚪ لا توجد وردية</span>
       <button class="theme-toggle" onclick="toggleTheme()" title="تغيير المظهر">🌓</button>
       <div class="user-badge" onclick="navTo('pg-settings')">
         <div class="ub-avatar" id="tb-avatar">م</div>
@@ -1684,12 +1966,19 @@ thead th{position:sticky;top:0;z-index:5}
 
     <div id="pg-shifts" class="page">
       <div class="pg-header">
-        <h2>🔒 إقفال الوردية</h2>
-        <p>سجّل إقفالات الورديات وتابع الفارق بين الرصيد النظامي والمبلغ الفعلي</p>
+        <h2>🔒 إدارة الورديات</h2>
+        <p>ابدأ وردية، سجّل عملياتك، ثم أقفلها مع تطابق الرصيد النظامي مع الفعلي</p>
       </div>
-      <button class="btn btn-blue" onclick="openShiftClosure()" style="width:100%;padding:14px;font-size:.95rem;margin-bottom:16px">🔒 إقفال وردية جديدة</button>
+
+      <div id="shift-current-card" class="shift-cur-card" style="display:none"></div>
+
+      <div id="shift-open-btn-wrap" style="margin-bottom:16px">
+        <button id="open-shift-btn" class="btn btn-green" onclick="openNewShift()" style="width:100%;padding:16px;font-size:1rem">🌅 بداية وردية جديدة</button>
+        <div style="font-size:.72rem;color:var(--text3);margin-top:6px;text-align:center">اضغط لبدء وردية جديدة وتسجيل الرصيد الافتتاحي تلقائياً</div>
+      </div>
+
       <div class="setting-group">
-        <div class="sg-h">📋 سجل الإقفالات</div>
+        <div class="sg-h" id="shifts-history-h">📋 سجل الورديات السابقة</div>
         <div id="shifts-list" style="padding:8px">
           <div style="padding:24px;text-align:center;color:var(--text3);font-size:.82rem">جاري التحميل...</div>
         </div>
@@ -1866,26 +2155,26 @@ thead th{position:sticky;top:0;z-index:5}
   </div>
 </div></div>
 
-<div class="mo" id="shift-mo"><div class="mo-box">
+<div class="mo" id="shift-mo"><div class="mo-box" style="max-width:480px">
   <h3>🔒 إقفال الوردية</h3>
-  <div id="shift-user-wrap" class="full" style="display:none; margin-bottom: 14px;">
-    <label>اختر الوردية المراد إقفالها</label>
-    <select id="shift-user-select" onchange="updateShiftView()" style="width: 100%; padding: 10px; border-radius: var(--r2); border: 1.5px solid var(--line); font-family: 'Tajawal', sans-serif; background: var(--surface);"></select>
+  <div class="shift-modal-info">
+    <div class="smi-row"><span>الوردية بدأت في:</span><strong id="shift-modal-opened-at">—</strong></div>
+    <div class="smi-row"><span>الرصيد الافتتاحي:</span><strong id="shift-modal-opening">—</strong></div>
+    <div class="smi-row"><span>عدد الحركات:</span><strong id="shift-modal-count">—</strong></div>
+    <div class="smi-row"><span>إجمالي الوارد:</span><strong id="shift-modal-deb" style="color:var(--green)">0.00</strong></div>
+    <div class="smi-row"><span>إجمالي الصادر:</span><strong id="shift-modal-crd" style="color:var(--red)">0.00</strong></div>
+    <div class="smi-row smi-total"><span>🎯 الرصيد النظامي للوردية:</span><strong id="shift-modal-system">0.00</strong></div>
   </div>
-  <div style="background:var(--b100);border:1.5px solid var(--b200);border-radius:var(--r2);padding:13px;margin-bottom:14px;text-align:center">
-    <div style="font-size:.7rem;color:var(--text3);margin-bottom:4px">الرصيد النظامي للمستخدم المحدد</div>
-    <div id="shift-system-bal" style="font-size:1.4rem;font-weight:900;color:var(--b600)">0.00 ر.س</div>
-  </div>
-  <div class="fg">
+  <div class="fg" style="margin-top:14px">
     <div class="full">
-      <label>المبلغ الفعلي في الصندوق (ر.س)</label>
+      <label>المبلغ الفعلي في الصندوق</label>
       <input type="number" id="shift-actual-amt" placeholder="0.00" min="0" step="0.01" inputmode="decimal" oninput="calcShiftVariance()">
     </div>
     <div id="shift-variance-row" class="full" style="display:none">
       <div style="background:var(--surface);border:1px solid var(--line);border-radius:var(--r2);padding:11px;display:flex;align-items:center;justify-content:space-between">
         <span style="font-size:.78rem;color:var(--text3)">الفارق:</span>
         <div style="display:flex;align-items:center;gap:6px">
-          <strong id="shift-variance-val" style="font-size:1rem">0.00 ر.س</strong>
+          <strong id="shift-variance-val" style="font-size:1rem">0.00</strong>
           <span id="shift-variance-lbl" style="font-size:.72rem;color:var(--text3)"></span>
         </div>
       </div>
@@ -1898,6 +2187,15 @@ thead th{position:sticky;top:0;z-index:5}
   <div class="br">
     <button class="btn btn-blue" id="shift-save-btn" onclick="saveShiftClosure()">🔒 تأكيد الإقفال</button>
     <button class="btn btn-ghost" onclick="closeMo('shift-mo')">إلغاء</button>
+  </div>
+</div></div>
+
+<div class="mo" id="shift-details-mo"><div class="mo-box" style="max-width:600px">
+  <h3 id="sd-title">📋 تفاصيل الوردية</h3>
+  <div id="sd-meta" style="margin-bottom:14px"></div>
+  <div id="sd-entries" style="max-height:50vh;overflow-y:auto;margin-bottom:14px"></div>
+  <div class="br">
+    <button class="btn btn-ghost" onclick="closeMo('shift-details-mo')">إغلاق</button>
   </div>
 </div></div>
 
